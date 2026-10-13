@@ -1870,6 +1870,198 @@ RSpec.describe Scheduling::Allocator do
     end
   end
 
+  describe ".allocate_cohort" do
+    let(:vol) { [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false}] }
+    let(:project) { Project.create(name: "cohort") }
+
+    # Hosts with distinct free capacity, so every choice has one best answer
+    # and the two paths can be compared placement by placement.
+    def fleet(cores:, ip4: 4, slices: false)
+      cores.each_with_index.map do |free_cores, i|
+        vmh = create_vm_host(total_cpus: 32, total_cores: 16, used_cores: 16 - free_cores, total_hugepages_1g: 120, used_hugepages_1g: 10 + i, net6: "fd10:9b0b:6b4b:8fb#{i}::/64")
+        BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+        StorageDevice.create(vm_host_id: vmh.id, name: "a", available_storage_gib: 400 + 10 * i, total_storage_gib: 500)
+        StorageDevice.create(vm_host_id: vmh.id, name: "b", available_storage_gib: 300 + 10 * i, total_storage_gib: 500)
+        SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
+        Address.create(cidr: "10.#{i}.0.0/#{32 - Math.log2(ip4).to_i}", routed_to_host_id: vmh.id).populate_ipv4_addresses if ip4 > 0
+        if slices
+          vmh.allow_slices
+          32.times { VmHostCpu.create(vm_host_id: vmh.id, cpu_number: it, io: it < 2) }
+        end
+        vmh
+      end
+    end
+
+    def cohort(n, **)
+      Array.new(n) do
+        vm = create_vm(project_id: project.id, name: "c#{Vm.count}", display_state: "creating", ip4_enabled: true, **)
+        create_storage_volumes(vm, vol)
+        vm
+      end
+    end
+
+    def host_state
+      VmHost.order(:id).select_map([:id, :used_cores, :used_hugepages_1g]) +
+        StorageDevice.order(:id).select_map([:id, :available_storage_gib])
+    end
+
+    before { allow(Al::Allocation).to receive(:random_score).and_return(0) }
+
+    # The property the cohort path has to keep: the same placements and the
+    # same final counters as calling allocate once per VM. Fleets are random
+    # and tight, so every resource the planner accounts for has a seed where
+    # it decides a placement, and score_offset breaks ties, so "the same" has
+    # one meaning -- with an exact tie the two paths could correctly differ,
+    # since the candidate query has no ORDER BY.
+    (1..12).each do |seed|
+      it "places every VM where allocate would have, from one candidate query (seed #{seed})" do
+        rng = Random.new(seed)
+        slices = seed.even?
+        ip4 = 2**rng.rand(0..2)
+        Array.new(rng.rand(2..4)) do |i|
+          vmh = create_vm_host(total_cpus: 32, total_cores: 16, used_cores: rng.rand(4..14), total_hugepages_1g: 64,
+            used_hugepages_1g: rng.rand(10..58), score_offset: i * 0.001, net6: "fd10:9b0b:6b4b:8fb#{i}::/64")
+          BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+          StorageDevice.create(vm_host_id: vmh.id, name: "a", available_storage_gib: rng.rand(60..200), total_storage_gib: 500)
+          StorageDevice.create(vm_host_id: vmh.id, name: "b", available_storage_gib: rng.rand(60..200), total_storage_gib: 500)
+          SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
+          Address.create(cidr: "10.#{i}.0.0/#{32 - Math.log2(ip4).to_i}", routed_to_host_id: vmh.id).populate_ipv4_addresses
+          if slices
+            vmh.allow_slices
+            32.times { VmHostCpu.create(vm_host_id: vmh.id, cpu_number: it, io: it < 2) }
+          end
+        end
+        volumes = [{"size_gib" => rng.rand(10..40), "use_bdev_ubi" => false, "encrypted" => false, "boot" => false}]
+        shape = {vcpus: 2 * rng.rand(1..2), memory_gib: 4 * rng.rand(1..2), ip4_enabled: rng.rand < 0.7,
+                 display_state: (rng.rand < 0.5) ? "creating" : "running"}
+        vms = Array.new(rng.rand(2..8)) do
+          vm = create_vm(project_id: project.id, name: "c#{Vm.count}", **shape)
+          create_storage_volumes(vm, volumes)
+          vm
+        end
+
+        scalar = scalar_state = nil
+        DB.transaction(savepoint: true, rollback: :always) do
+          scalar = vms.map do |vm|
+            Al.allocate(vm, volumes)
+            vm.reload.vm_host_id
+          rescue Al::NoSpaceLeft
+            nil
+          end
+          scalar_state = host_state
+        end
+        # The rollback undoes the rows, not the in-memory models, which would
+        # otherwise look already saved to the cohort's writes.
+        vms.each(&:reload)
+
+        if scalar.include?(nil)
+          expect { Al.allocate_cohort(vms, volumes) }.to raise_error(Al::NoSpaceLeft)
+          expect(vms.map { it.reload.vm_host_id }).to all(be_nil)
+        else
+          expect(Al::Allocation).to receive(:candidate_hosts).once.and_call_original
+          Al.allocate_cohort(vms, volumes)
+          expect(vms.map { it.reload.vm_host_id }).to eq(scalar)
+          expect(host_state).to eq(scalar_state)
+        end
+      end
+    end
+
+    it "keeps the devices in free-space order, which picks the next volume's device" do
+      host = {available_storage_gib: 310, total_storage_gib: 1000,
+              storage_devices: [{"id" => "x", "available_storage_gib" => 150, "total_storage_gib" => 500},
+                {"id" => "y", "available_storage_gib" => 160, "total_storage_gib" => 500}]}
+      request = create_req(vm, [{"size_gib" => 60}])
+      # y is the smallest device that keeps the reserve, so it takes the volume
+      # and drops below x.
+      Al::StorageAllocation.new(host, request).consume!(host)
+      expect(host[:storage_devices].map { it.values_at("id", "available_storage_gib") }).to eq([["y", 100], ["x", 150]])
+      expect(host[:available_storage_gib]).to eq(250)
+    end
+
+    it "takes a new slice's cores and memory from the host, not the request's" do
+      host = {vm_host_id: "h", total_cpus: 32, total_cores: 16, used_cores: 2, total_hugepages_1g: 64, used_hugepages_1g: 4,
+              accepts_slices: true, available_storage_gib: 100, total_storage_gib: 100, storage_devices: [], num_gpus: 0,
+              vm_provisioning_count: 0, ipv4_free: 1, family: "standard", location_id: Location::HETZNER_FSN1_ID, score_offset: 0}
+      vm = Vm.new(vcpus: 3, memory_gib: 6, arch: "x64", family: "standard", cpu_percent_limit: 300, display_state: "running").tap { it.id = Vm.generate_uuid }
+      Al::Allocation.new(host, create_req(vm, [])).consume!(vm)
+      # 3 vcpus round up to 2 cores, which is 4 cpus, which is 16G of slice.
+      expect(host.values_at(:used_cores, :used_hugepages_1g)).to eq([4, 20])
+    end
+
+    it "writes nothing when the cohort does not fit" do
+      fleet(cores: [2, 1])
+      vms = cohort(4)
+      before = host_state
+
+      expect { Al.allocate_cohort(vms, vol) }.to raise_error(Al::NoSpaceLeft, /1 of 4 VMs in the cohort/)
+      expect(host_state).to eq(before)
+      expect(vms.map { it.reload.vm_host_id }).to all(be_nil)
+      expect(AssignedVmAddress.count).to eq(0)
+    end
+
+    it "counts down free ipv4 addresses rather than trusting the query's yes" do
+      best, other = fleet(cores: [12, 4], ip4: 2)
+      AssignedVmAddress.create(dst_vm_id: create_vm.id, ip: "10.0.0.0", address_id: Address.first(routed_to_host_id: best.id).id)
+      # Not "creating", so the provisioning penalty cannot be what moves the
+      # second VM; only the address count can.
+      vms = cohort(2, display_state: "running")
+
+      Al.allocate_cohort(vms, vol)
+      expect(vms.map { it.reload.vm_host_id }).to eq([best.id, other.id])
+    end
+
+    it "places VMs without ipv4 on hosts that have none to give" do
+      only = fleet(cores: [12], ip4: 0).first
+      vms = cohort(3, ip4_enabled: false)
+
+      Al.allocate_cohort(vms, vol)
+      expect(vms.map { it.reload.vm_host_id }).to eq([only.id] * 3)
+    end
+
+    it "spreads a cohort over distinct hosts when asked, or places none of it" do
+      hosts = fleet(cores: [12, 10])
+
+      pair = cohort(2)
+      Al.allocate_cohort(pair, vol, distinct_hosts: true)
+      expect(pair.map { it.reload.vm_host_id }).to match_array(hosts.map(&:id))
+
+      trio = cohort(3)
+      expect { Al.allocate_cohort(trio, vol, distinct_hosts: true) }.to raise_error(Al::NoSpaceLeft)
+      expect(trio.map { it.reload.vm_host_id }).to all(be_nil)
+    end
+
+    it "writes hosts in id order whatever order it placed them in, so cohorts sharing hosts cannot deadlock" do
+      a, b = fleet(cores: [12, 10]).sort_by(&:id)
+      # Make the higher id the preferred host, so it is placed first.
+      b.update(score_offset: -1)
+      written = []
+      allow(Al::Allocation).to receive(:update_vm).and_wrap_original do |m, vm_host, vm|
+        written << vm_host.id
+        m.call(vm_host, vm)
+      end
+
+      vms = cohort(2)
+      Al.allocate_cohort(vms, vol, distinct_hosts: true)
+      expect(vms.map { it.reload.vm_host_id }).to eq([b.id, a.id])
+      expect(written).to eq([a.id, b.id])
+    end
+
+    it "does not count a VM that is no longer being created against its host" do
+      fleet(cores: [12])
+      vm = cohort(1, display_state: "running").first
+      allocation = Al::Allocation.plan([Al.request_for(vm, vol)], [vm])[0][1]
+      expect(allocation.candidate_host[:vm_provisioning_count]).to eq(0)
+    end
+
+    it "refuses an empty cohort, mixed shapes, shared slices and GPUs" do
+      fleet(cores: [12])
+      expect { Al.allocate_cohort([], vol) }.to raise_error(ArgumentError, /at least one VM/)
+      expect { Al.allocate_cohort(cohort(1) + cohort(1, vcpus: 4), vol) }.to raise_error(ArgumentError, /same shape/)
+      expect { Al.allocate_cohort(cohort(1, family: "burstable"), vol) }.to raise_error(ArgumentError, /shared slices or GPUs/)
+      expect { Al.allocate_cohort(cohort(1), vol, gpu_count: 1) }.to raise_error(ArgumentError, /shared slices or GPUs/)
+    end
+  end
+
   describe "#allocate_spdk_installation" do
     it "fails if total weight is zero" do
       si_1 = SpdkInstallation.new(allocation_weight: 0)

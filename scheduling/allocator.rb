@@ -13,6 +13,48 @@ module Scheduling::Allocator
     Clog.emit("vm allocated", {allocation: allocation.to_s, duration: Time.now - vm.created_at})
   end
 
+  # Place a cohort: several VMs of one shape, all or none of them.
+  #
+  # `allocate` runs the candidate query once per VM. A cohort runs it once,
+  # then places each VM in turn against the rows it returned, taking what each
+  # placement uses out of the row it landed on -- so the next placement sees
+  # the host as a fresh query would have. Every write happens in one
+  # transaction, after every VM has a place, so a cohort that does not fit
+  # changes nothing.
+  #
+  # With distinct_hosts, no two VMs share a host: anti-affinity for things
+  # that must not fail together, decided in the same transaction that places
+  # them, instead of by placing one member and hoping about the next.
+  #
+  # Shared slices and GPUs are refused rather than modelled. Both pick from
+  # state the candidate row does not carry -- existing slices, partitions,
+  # iommu groups -- and getting it slightly wrong would place two VMs on one
+  # resource. Those VMs go through `allocate`.
+  def self.allocate_cohort(vms, storage_volumes, distinct_hosts: false, **)
+    fail ArgumentError, "a cohort needs at least one VM" if vms.empty?
+
+    requests = vms.map { request_for(it, storage_volumes, **) }
+    shape = ->(request) { request.to_h.except(:vm_id, :diagnostics) }
+    fail ArgumentError, "every VM in a cohort must have the same shape" unless requests.map(&shape).uniq.one?
+    fail ArgumentError, "a cohort cannot use shared slices or GPUs" if requests.first.require_shared_slice || requests.first.gpu_count > 0
+
+    plan = Allocation.plan(requests, vms, distinct_hosts:)
+    unplaced = plan.count { |_, allocation| allocation.nil? }
+    fail NoSpaceLeft, "#{unplaced} of #{vms.size} VMs in the cohort of #{vms.first} have no space on any eligible host" if unplaced > 0
+
+    # Hosts are written in id order, so two cohorts that share hosts take
+    # their row locks in the same order and wait for each other instead of
+    # deadlocking.
+    DB.transaction do
+      plan.sort_by { |_, allocation| allocation.candidate_host[:vm_host_id] }
+        .each { |vm, allocation| allocation.update(vm) }
+    end
+
+    plan.each do |vm, allocation, placed|
+      Clog.emit("vm allocated", {allocation: placed, duration: Time.now - vm.created_at, cohort: vms.size})
+    end
+  end
+
   def self.request_for(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], family_filter: [], data_center_exclusion_filter: [], os_filter: nil)
     requires_track_written = storage_volumes.any? { it["track_written"] }
     uses_machine_image = storage_volumes.any? { it["machine_image_version_id"] }
@@ -128,7 +170,7 @@ module Scheduling::Allocator
   end
 
   class Allocation
-    attr_reader :score
+    attr_reader :score, :candidate_host
 
     # simplecov:disable
     def self.freeze
@@ -150,6 +192,39 @@ module Scheduling::Allocator
 
     def self.candidate_hosts(request)
       CandidateHosts.new(request).hosts
+    end
+
+    # One candidate query for the whole cohort, then `best_allocation`'s
+    # choice once per request, with each choice consumed from its row before
+    # the next is made. Returns [vm, allocation or nil, description] for each.
+    #
+    # Members differ only in vm_id, so an Allocation scores the same for any
+    # of them, and only the host that was just chosen has changed. Each pick
+    # therefore rebuilds one Allocation rather than one per candidate, which
+    # is the difference between planning in O(VMs + hosts) constructions and
+    # O(VMs * hosts): on a 400-host fleet the latter cost more than the
+    # queries it replaced.
+    def self.plan(requests, vms, distinct_hosts: false)
+      options = candidate_hosts(requests.first).map { Allocation.new(it, requests.first) }
+      requests.zip(vms).map do |request, vm|
+        i = options.each_index
+          .select { options[it].is_valid && options[it].has_ipv4? }
+          .min_by { options[it].score + random_score }
+        next [vm, nil, nil] unless i
+
+        # Rebuilt with this VM's own request, for its own log line. Described
+        # before it is consumed, so the log shows the host as this VM found
+        # it, which is what `allocate` would have logged.
+        best = Allocation.new(options[i].candidate_host, request)
+        placed = best.to_s
+        best.consume!(vm)
+        if distinct_hosts
+          options.delete_at(i)
+        else
+          options[i] = Allocation.new(best.candidate_host, request)
+        end
+        [vm, best, placed]
+      end
     end
 
     class CandidateHosts
@@ -408,6 +483,24 @@ module Scheduling::Allocator
       @allocations.all? { it.is_valid }
     end
 
+    # The candidate query already requires a free address of a host that
+    # one VM is placed on. A cohort can place several, so it checks the count.
+    def has_ipv4?
+      !@request.ip4_enabled || @candidate_host[:ipv4_free] > 0
+    end
+
+    # Take this placement out of the candidate row it was built from, so the
+    # next Allocation built from the row sees what a fresh candidate query
+    # would have. Only the database is changed by `update`; this changes only
+    # the row.
+    def consume!(vm)
+      @allocations.each { it.consume!(@candidate_host) }
+      @candidate_host[:ipv4_free] -= 1 if @request.ip4_enabled
+      # Counted by the candidate query from the vm table, so the VM counts
+      # against its host once placed only if it is still being created.
+      @candidate_host[:vm_provisioning_count] += 1 if vm.display_state == "creating"
+    end
+
     def update(vm)
       vm_host = VmHost[@candidate_host[:vm_host_id]]
       DB.transaction do
@@ -492,6 +585,10 @@ module Scheduling::Allocator
 
     def get_vm_host_update
       {@column => Sequel[@column] + @requested}
+    end
+
+    def consume!(candidate_host)
+      candidate_host[@column] += @requested
     end
 
     def update(vm, vm_host)
@@ -611,6 +708,13 @@ module Scheduling::Allocator
           )
         end
       end
+    end
+
+    # The wrapped allocations already hold the new slice's cores and memory,
+    # which is what `update` takes from the host. A cohort never reuses a
+    # slice, so there is no existing one to account for here.
+    def consume!(candidate_host)
+      @vm_host_allocations.each { it.consume!(candidate_host) }
     end
 
     def select_cpuset(vm_host_id, n)
@@ -760,6 +864,16 @@ module Scheduling::Allocator
 
     def utilization
       1 - (@candidate_host[:available_storage_gib] - @request.storage_gib).fdiv(@candidate_host[:total_storage_gib])
+    end
+
+    # The devices stay ordered by free space, as the candidate query orders
+    # them, since that order decides which device the next volume goes on.
+    def consume!(candidate_host)
+      left = @storage_device_allocations.to_h { [it.id, it.available_storage_gib] }
+      candidate_host[:available_storage_gib] -= @request.storage_gib
+      candidate_host[:storage_devices] = candidate_host[:storage_devices]
+        .map { it.merge("available_storage_gib" => left.fetch(it["id"])) }
+        .sort_by { it["available_storage_gib"] }
     end
 
     def reduces_large_device_multiples?
