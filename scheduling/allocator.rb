@@ -387,8 +387,17 @@ module Scheduling::Allocator
       @device_allocations << GpuAllocation.new(candidate_host, request) if request.gpu_count > 0
 
       if request.use_slices && candidate_host[:accepts_slices]
-        # Wrap around and replace the host allocations. That way we can control that logic from the slice POV
-        @vm_host_allocations = [VmHostSliceAllocation.new(candidate_host, request, @vm_host_allocations)]
+        # A new slice takes a whole number of cores from the host, and memory
+        # in proportion to its cpus rather than the VM's memory_gib -- that is
+        # what VmHostSliceAllocation#update writes. Judge the host by the same
+        # figures, or a host can pass as valid and then fail the hugepages
+        # check constraint when the slice is written.
+        threads_per_core = candidate_host[:total_cpus] / candidate_host[:total_cores]
+        slice_memory_gib = request.memory_gib_for_vcpus(request_cores * threads_per_core)
+        @vm_host_allocations = [VmHostSliceAllocation.new(candidate_host, request, [
+          @vm_host_allocations.first,
+          VmHostAllocation.new(:used_hugepages_1g, candidate_host[:total_hugepages_1g], candidate_host[:used_hugepages_1g], slice_memory_gib),
+        ])]
       end
 
       @allocations = @vm_host_allocations + @device_allocations

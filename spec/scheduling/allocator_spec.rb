@@ -1407,6 +1407,44 @@ RSpec.describe Scheduling::Allocator do
     end
   end
 
+  describe "slice sizing" do
+    let(:vol) { [{"size_gib" => 10, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false}] }
+
+    # 6G of hugepages free. A new slice for these VMs takes more than that
+    # from the host, though each VM asks for less.
+    before do
+      vmh = create_vm_host(total_cpus: 32, total_cores: 16, used_cores: 4, total_hugepages_1g: 64, used_hugepages_1g: 58, net6: "fd10:9b0b:6b4b:8fb0::/64")
+      vmh.allow_slices
+      32.times { VmHostCpu.create(vm_host_id: vmh.id, cpu_number: it, io: it < 2) }
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      StorageDevice.create(vm_host_id: vmh.id, name: "a", available_storage_gib: 200, total_storage_gib: 500)
+      SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
+    end
+
+    def allocating(**)
+      vm = create_vm(**)
+      create_storage_volumes(vm, vol)
+      -> { described_class.allocate(vm, vol, family_filter: ["standard"]) }
+    end
+
+    it "judges a host by the memory a dedicated slice takes, not the memory the VM asks for" do
+      # 4 vcpus is 2 cores is 4 cpus is a 16G slice. This used to pass as
+      # valid on 4G and then fail the hugepages check constraint on write.
+      expect(allocating(vcpus: 4, memory_gib: 4)).to raise_error(Al::NoSpaceLeft)
+      expect(VmHost.first.used_hugepages_1g).to eq(58)
+    end
+
+    it "judges a host the same way for a new shared slice" do
+      expect(allocating(family: "burstable", vcpus: 1, memory_gib: 2, cpu_percent_limit: 50)).to raise_error(Al::NoSpaceLeft)
+    end
+
+    it "still places a VM whose slice fits" do
+      VmHost.first.update(used_hugepages_1g: 48)
+      allocating(vcpus: 4, memory_gib: 4).call
+      expect(VmHost.first.used_hugepages_1g).to eq(64)
+    end
+  end
+
   describe "slice selection" do
     let(:vol) {
       [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false}]
