@@ -187,6 +187,7 @@ module Scheduling::Allocator
               :total_storage_gib,
               :storage_devices,
               Sequel.function(:coalesce, :ipv4_available, false).as(:ipv4_available),
+              Sequel.function(:coalesce, :ipv4_free, 0).as(:ipv4_free),
               Sequel.function(:coalesce, :num_gpus, 0).as(:num_gpus),
               Sequel.function(:coalesce, :available_gpus, 0).as(:available_gpus),
               Sequel.function(:coalesce, :use_gpu_partition, false).as(:use_gpu_partition),
@@ -202,7 +203,8 @@ module Scheduling::Allocator
               .join(:address, [:cidr])
               .where { assigned_vm_address[:ip] =~ nil }
               .select_group(:routed_to_host_id)
-              .select_append { (count.function.* > 0).as(:ipv4_available) })
+              .select_append { (count.function.* > 0).as(:ipv4_available) }
+              .select_append { count.function.*.as(:ipv4_free) })
             .with(:storage_devices, DB[:storage_device]
               .select_group(:vm_host_id)
               .select_append { count.function.*.as(num_storage_devices) }

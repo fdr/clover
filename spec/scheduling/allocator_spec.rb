@@ -206,6 +206,7 @@ RSpec.describe Scheduling::Allocator do
                  used_hugepages_1g: vmh.used_hugepages_1g,
                  vm_host_id: vmh.id,
                  ipv4_available: true,
+                 ipv4_free: 4,
                  num_gpus: 0,
                  use_gpu_partition: false,
                  available_gpus: 0,
@@ -225,6 +226,17 @@ RSpec.describe Scheduling::Allocator do
       req.location_filter = [Location::HETZNER_FSN1_ID]
 
       expect(Al::Allocation.candidate_hosts(req).map { it[:vm_host_id] }).to eq([vmh.id])
+    end
+
+    it "counts the free ipv4 addresses on each host, not only whether there is one" do
+      vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      address = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      address.populate_ipv4_addresses
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 123, total_storage_gib: 345)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      AssignedVmAddress.create(dst_vm_id: create_vm.id, ip: "1.1.1.1", address_id: address.id)
+
+      expect(Al::Allocation.candidate_hosts(req).map { it[:ipv4_free] }).to eq([3])
     end
 
     it "retrieves provisioning count" do
@@ -252,6 +264,7 @@ RSpec.describe Scheduling::Allocator do
                  used_hugepages_1g: vmh.used_hugepages_1g,
                  vm_host_id: vmh.id,
                  ipv4_available: true,
+                 ipv4_free: 4,
                  num_gpus: 0,
                  available_gpus: 0,
                  use_gpu_partition: false,
