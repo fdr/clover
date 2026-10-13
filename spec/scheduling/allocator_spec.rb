@@ -1394,6 +1394,57 @@ RSpec.describe Scheduling::Allocator do
     end
   end
 
+  describe "slice sizing" do
+    let(:vol) { [{"size_gib" => 10, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false}] }
+
+    def create_slice_host(free_hugepages_1g, arch: "x64", total_cpus: 32, total_cores: 16)
+      # cpus 0 and 1 are io cpus
+      vmh = create_vm_host(arch:, total_cpus:, total_cores:, used_cores: 2 * total_cores / total_cpus, total_hugepages_1g: 64, used_hugepages_1g: 64 - free_hugepages_1g, accepts_slices: true)
+      total_cpus.times { VmHostCpu.create(vm_host_id: vmh.id, cpu_number: it, io: it < 2) }
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 200, total_storage_gib: 500)
+      SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
+      vmh
+    end
+
+    # burstable-1 asks for 2G on x64 and 1G on arm64
+    def create_burstable_vm(arch: "x64")
+      vm = create_vm(family: "burstable", vcpus: 1, memory_gib: (arch == "x64") ? 2 : 1, cpu_percent_limit: 50, cpu_burst_percent_limit: 50, arch:)
+      create_storage_volumes(vm, vol)
+      vm
+    end
+
+    it "judges a host by the memory of the new slice, not the memory of the vm" do
+      # The vm's slice has 1 core of 2 threads, so it takes 8G from the host.
+      vmh = create_slice_host(6)
+      vm = create_burstable_vm
+
+      expect { described_class.allocate(vm, vol, family_filter: ["standard"]) }.to raise_error(Al::NoSpaceLeft)
+      expect(vmh.reload.used_hugepages_1g).to eq(58)
+    end
+
+    it "places a vm on a host with free memory for the new slice" do
+      vmh = create_slice_host(8)
+      vm = create_burstable_vm
+      described_class.allocate(vm, vol, family_filter: ["standard"])
+
+      expect(vm.reload.vm_host_slice.total_memory_gib).to eq(8)
+      expect(vmh.reload.used_hugepages_1g).to eq(64)
+    end
+
+    it "judges a host with one thread per core by the cpus of the new slice" do
+      # The vm's 1 vcpu rounds up to a slice of 2 cores, so it takes 6G from the host.
+      vmh = create_slice_host(5, arch: "arm64", total_cpus: 16, total_cores: 16)
+      vm = create_burstable_vm(arch: "arm64")
+      expect { described_class.allocate(vm, vol, family_filter: ["standard"]) }.to raise_error(Al::NoSpaceLeft)
+
+      vmh.update(used_hugepages_1g: 58)
+      described_class.allocate(vm, vol, family_filter: ["standard"])
+      expect(vm.reload.vm_host_slice.total_memory_gib).to eq(6)
+      expect(vmh.reload.used_hugepages_1g).to eq(64)
+    end
+  end
+
   describe "slice selection" do
     let(:vol) {
       [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false}]
@@ -1755,6 +1806,13 @@ RSpec.describe Scheduling::Allocator do
       req = create_req(vm, vol)
 
       expect(req.memory_gib_for_vcpus(vm.vcpus)).to eq 6
+    end
+
+    it "slice_cpus gives a 1-vcpu VM a slice of two cpus" do
+      req = create_req(create_vm(family: "burstable", vcpus: 1, memory_gib: 2), vol)
+
+      expect(req.slice_cpus(2)).to eq 2
+      expect(req.slice_cpus(1)).to eq 2
     end
 
     it "select_cpuset fails if not enough cpus" do

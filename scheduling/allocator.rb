@@ -113,6 +113,11 @@ module Scheduling::Allocator
       (Float(adjusted_vcpus) / threads_per_core).ceil
     end
 
+    # The number of cpus of a new slice for the VM: its cores, in threads.
+    def slice_cpus(threads_per_core)
+      cores_for_vcpus(threads_per_core) * threads_per_core
+    end
+
     def single_ubicloud_location?
       return false unless location_filter.one?
       Location[location_filter.first].provider == "ubicloud"
@@ -373,14 +378,21 @@ module Scheduling::Allocator
     def initialize(candidate_host, request)
       @candidate_host = candidate_host
       @request = request
-      request_cores = request.cores_for_vcpus(candidate_host[:total_cpus] / candidate_host[:total_cores])
+      threads_per_core = candidate_host[:total_cpus] / candidate_host[:total_cores]
+      request_cores = request.cores_for_vcpus(threads_per_core)
+      in_slice = request.use_slices && candidate_host[:accepts_slices]
+
+      # A VM in a new slice takes from the host what the slice takes: memory
+      # in proportion to the slice's cpus, not the VM's memory_gib. That is
+      # what VmHostSliceAllocation#update writes, so judge the host by it.
+      memory_gib = in_slice ? request.memory_gib_for_vcpus(request.slice_cpus(threads_per_core)) : request.memory_gib
 
       @vm_host_allocations = [VmHostCpuAllocation.new(:used_cores, candidate_host[:total_cores], candidate_host[:used_cores], request_cores),
-        VmHostAllocation.new(:used_hugepages_1g, candidate_host[:total_hugepages_1g], candidate_host[:used_hugepages_1g], request.memory_gib)]
+        VmHostAllocation.new(:used_hugepages_1g, candidate_host[:total_hugepages_1g], candidate_host[:used_hugepages_1g], memory_gib)]
       @device_allocations = [StorageAllocation.new(candidate_host, request)]
       @device_allocations << GpuAllocation.new(candidate_host, request) if request.gpu_count > 0
 
-      if request.use_slices && candidate_host[:accepts_slices]
+      if in_slice
         # Wrap around and replace the host allocations. That way we can control that logic from the slice POV
         @vm_host_allocations = [VmHostSliceAllocation.new(candidate_host, request, @vm_host_allocations)]
       end
@@ -562,9 +574,7 @@ module Scheduling::Allocator
           # This may seem redundant but it is neccessary for cases
           # like 1-vcpu VM.
           threads_per_core = vm_host.total_cpus / vm_host.total_cores
-          request_cores = @request.cores_for_vcpus(threads_per_core)
-          slice_cpus = request_cores * threads_per_core
-          cpus = select_cpuset(vm_host.id, slice_cpus)
+          cpus = select_cpuset(vm_host.id, @request.slice_cpus(threads_per_core))
 
           st = Prog::Vm::VmHostSliceNexus.assemble_with_host(
             "#{vm.family}_#{vm.inhost_name}",
