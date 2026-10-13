@@ -146,6 +146,13 @@ class VmHost < Sequel::Model
       .where(cidr: assigned_subnets_dataset.select(:cidr))
       .exclude(assigned_vm_addresses_dataset.where(ip: Sequel[:ipv4_address][:ip]).select(1).exists)
       .order { random.function }
+      # Concurrent allocations see the same free addresses until one of them
+      # commits. Lock the chosen address and skip ones locked by other
+      # transactions, so they pick different addresses instead of colliding
+      # on assigned_vm_address's unique key -- which fails the allocation,
+      # and can deadlock two allocations that also hold host rows. Only the
+      # address row is locked, not the subnet every pick joins to.
+      .lock_style("FOR NO KEY UPDATE OF ipv4_address SKIP LOCKED")
       .first
 
     res ? [res.delete(:ip), Address.call(res)] : [nil, nil]
