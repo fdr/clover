@@ -4,7 +4,16 @@ module Scheduling::Allocator
   class NoSpaceLeft < RuntimeError
   end
 
-  def self.allocate(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], family_filter: [], data_center_exclusion_filter: [], os_filter: nil)
+  def self.allocate(vm, storage_volumes, **)
+    request = request_for(vm, storage_volumes, **)
+    allocation = Allocation.best_allocation(request)
+    fail NoSpaceLeft, "#{vm} no space left on any eligible host" unless allocation
+
+    allocation.update(vm)
+    Clog.emit("vm allocated", {allocation: allocation.to_s, duration: Time.now - vm.created_at})
+  end
+
+  def self.request_for(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], family_filter: [], data_center_exclusion_filter: [], os_filter: nil)
     requires_track_written = storage_volumes.any? { it["track_written"] }
     uses_machine_image = storage_volumes.any? { it["machine_image_version_id"] }
     uses_remote_storage_server = storage_volumes.any? { it["remote_storage_server_id"] }
@@ -15,7 +24,7 @@ module Scheduling::Allocator
       VhostBlockBackend::MIN_ARCHIVE_SUPPORT_VERSION
     end
 
-    request = Request.new(
+    Request.new(
       vm.id,
       vm.vcpus,
       vm.memory_gib,
@@ -43,11 +52,6 @@ module Scheduling::Allocator
       minimum_vhost_block_backend_version,
       os_filter,
     )
-    allocation = Allocation.best_allocation(request)
-    fail NoSpaceLeft, "#{vm} no space left on any eligible host" unless allocation
-
-    allocation.update(vm)
-    Clog.emit("vm allocated", {allocation: allocation.to_s, duration: Time.now - vm.created_at})
   end
 
   Request = Struct.new(
