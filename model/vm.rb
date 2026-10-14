@@ -225,14 +225,21 @@ class Vm < Sequel::Model
   end
 
   def save_with_ephemeral_net6_error_retrying(vm_host, max_retries: 2)
-    save_changes
-  rescue Sequel::ValidationFailed
-    if errors.keys == [:ephemeral_net6] && max_retries > 0
+    columns = changed_columns.dup
+    begin
+      # In a savepoint, so that after a unique key violation the transaction
+      # can still retry.
+      DB.transaction(savepoint: true) { save_changes }
+    rescue Sequel::ValidationFailed
+      raise unless errors.keys == [:ephemeral_net6] && max_retries > 0
+
       max_retries -= 1
       self.ephemeral_net6 = vm_host.ip6_random_vm_network.to_s
+      # A failed update has cleared changed_columns, so mark them again, or
+      # the retry would save ephemeral_net6 alone.
+      columns.each { modified!(it) }
       retry
     end
-    raise
   end
 
   def in_maintenance_window?
