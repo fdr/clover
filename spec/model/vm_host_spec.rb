@@ -194,6 +194,16 @@ RSpec.describe VmHost do
       expect(Clog).not_to receive(:emit)
       expect(vm_host.ip4_random_vm_network).to eq [nil, nil]
     end
+
+    it "picks another address when the one it locked is taken" do
+      # The pick's query does not see an assignment without an address row,
+      # just as it does not see one committed after the query's snapshot.
+      Address.create(vm_host:, cidr: "128.0.0.0/31").populate_ipv4_addresses
+      AssignedVmAddress.create(dst_vm_id: create_vm.id, ip: "128.0.0.0")
+
+      # The pick is random, so pick more than once.
+      expect(Array.new(8) { vm_host.ip4_random_vm_network.first.to_s }.uniq).to eq ["128.0.0.1"]
+    end
   end
 
   describe "#sshable_address" do

@@ -141,22 +141,33 @@ class VmHost < Sequel::Model
   end
 
   def ip4_random_vm_network
-    res = DB[:ipv4_address]
-      .join(:address, [:cidr])
-      .where(cidr: assigned_subnets_dataset.select(:cidr))
-      .exclude(assigned_vm_addresses_dataset.where(ip: Sequel[:ipv4_address][:ip]).select(1).exists)
-      .order { random.function }
-      # Concurrent allocations on the host see the same free addresses until
-      # one of them commits. Lock the chosen address and skip the ones other
-      # allocations have locked, so allocations in progress pick different
-      # addresses instead of colliding on assigned_vm_address's unique key.
-      # Lock only the ipv4_address row: every pick on a subnet joins the same
-      # address row, and if that row were locked too, SKIP LOCKED would find
-      # no address while another pick is in progress.
-      .lock_style("FOR NO KEY UPDATE OF ipv4_address SKIP LOCKED")
-      .first
+    taken = []
+    loop do
+      res = DB[:ipv4_address]
+        .join(:address, [:cidr])
+        .where(cidr: assigned_subnets_dataset.select(:cidr))
+        .exclude(assigned_vm_addresses_dataset.where(ip: Sequel[:ipv4_address][:ip]).select(1).exists)
+        .exclude(Sequel[:ipv4_address][:ip] => taken)
+        .order { random.function }
+        # Concurrent allocations on the host see the same free addresses until
+        # one of them commits. Lock the chosen address and skip the ones other
+        # allocations have locked, so allocations in progress pick different
+        # addresses instead of colliding on assigned_vm_address's unique key.
+        # Lock only the ipv4_address row: every pick on a subnet joins the same
+        # address row, and if that row were locked too, SKIP LOCKED would find
+        # no address while another pick is in progress.
+        .lock_style("FOR NO KEY UPDATE OF ipv4_address SKIP LOCKED")
+        .first
+      return [nil, nil] unless res
 
-    res ? [res.delete(:ip), Address.call(res)] : [nil, nil]
+      # The query's snapshot is older than its lock. An allocation that held
+      # the address and committed in between has assigned it, and only a new
+      # query sees that. Once locked here, nobody else can assign it.
+      ip = res.delete(:ip)
+      return [ip, Address.call(res)] if AssignedVmAddress.where(ip: ip.to_s).empty?
+
+      taken << ip
+    end
   end
 
   # IPv4 range to use for setting local_vetho_ip for VM in hosts.
