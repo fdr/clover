@@ -16,8 +16,8 @@ RSpec.describe CsumGuardSetup do
 
   def expect_attach(netns, tap, obj)
     expect(cgs).to receive(:_run_command).with("tc", "-n", netns, "qdisc", "replace", "dev", tap, "clsact")
-    expect(cgs).to receive(:_run_command).with("tc", "-n", netns, "filter", "replace", "dev", tap, "ingress", "pref", "49152", "handle", "1",
-      "bpf", "direct-action", "object-file", obj, "section", "tc") { calls << [:attach, tap] }
+    expect(cgs).to receive(:_run_command).with("nsenter", "--net=/var/run/netns/#{netns}", "tc", "filter", "replace", "dev", tap, "ingress",
+      "pref", "49152", "handle", "1", "bpf", "direct-action", "object-file", obj, "section", "tc") { calls << [:attach, tap] }
   end
 
   def expect_netns_list(json)
@@ -41,6 +41,7 @@ RSpec.describe CsumGuardSetup do
   describe "#install" do
     it "checks the kernel, then downloads and attaches every tap under the lock" do
       expect(cgs).to receive(:check_kernel) { calls << :kernel }
+      expect(cgs).to receive(:check_bpffs) { calls << :bpffs }
       expect_lock
       expect(cgs).to receive(:download_object) { calls << :download }
       expect(cgs).to receive(:each_vm_tap).and_yield("vm1", "tap1").and_yield("vm2", "tap2")
@@ -48,7 +49,7 @@ RSpec.describe CsumGuardSetup do
       expect_attach("vm2", "tap2", object)
 
       cgs.install
-      expect(calls).to eq([:kernel, :lock, :download, [:attach, "tap1"], [:attach, "tap2"]])
+      expect(calls).to eq([:kernel, :bpffs, :lock, :download, [:attach, "tap1"], [:attach, "tap2"]])
     end
   end
 
@@ -113,6 +114,20 @@ RSpec.describe CsumGuardSetup do
       expect(cgs).to receive(:_run_command).with("uname -r").and_return("linux\n")
 
       expect { cgs.check_kernel }.to raise_error(/Cannot parse kernel release "linux"/)
+    end
+  end
+
+  describe "#check_bpffs" do
+    it "accepts a mounted bpffs" do
+      expect(File).to receive(:read).with("/proc/mounts").and_return("bpf /sys/fs/bpf bpf rw,nosuid 0 0\n")
+
+      expect { cgs.check_bpffs }.not_to raise_error
+    end
+
+    it "fails without a bpffs" do
+      expect(File).to receive(:read).with("/proc/mounts").and_return("sysfs /sys sysfs rw 0 0\n")
+
+      expect { cgs.check_bpffs }.to raise_error(/No bpffs mounted at \/sys\/fs\/bpf/)
     end
   end
 

@@ -50,6 +50,7 @@ class CsumGuardSetup
   # busy host takes long, so VM creation never waits for it.
   def install
     check_kernel
+    check_bpffs
     with_lock do
       download_object
       each_vm_tap { |netns, tap| attach(netns, tap, object) }
@@ -87,6 +88,13 @@ class CsumGuardSetup
     return if ([m[1].to_i, m[2].to_i] <=> MIN_KERNEL) >= 0
 
     fail "Kernel #{release} is older than #{MIN_KERNEL.join(".")}, which the checksum guard requires"
+  end
+
+  # The program pins its counters there, shared by every tap.
+  def check_bpffs
+    return if File.read("/proc/mounts").include?(" /sys/fs/bpf bpf ")
+
+    fail "No bpffs mounted at /sys/fs/bpf"
   end
 
   def with_lock
@@ -156,10 +164,12 @@ class CsumGuardSetup
     r("ip", "-n", netns, "link", "show", "dev", tap, expect: [0, 1, 255]).empty?
   end
 
+  # nsenter keeps the host's bpffs in view, so every tap shares the pinned
+  # counters. "tc -n" remounts /sys, which would pin a private map per tap.
   def attach(netns, tap, obj)
     r "tc", "-n", netns, "qdisc", "replace", "dev", tap, "clsact"
-    r "tc", "-n", netns, "filter", "replace", "dev", tap, "ingress", "pref", TC_PREF, "handle", "1",
-      "bpf", "direct-action", "object-file", obj, "section", "tc"
+    r "nsenter", "--net=#{File.join(NETNS_DIR, netns)}", "tc", "filter", "replace", "dev", tap, "ingress",
+      "pref", TC_PREF, "handle", "1", "bpf", "direct-action", "object-file", obj, "section", "tc"
   end
 
   # tc exits 2 when the filter or the clsact qdisc is already gone. The
